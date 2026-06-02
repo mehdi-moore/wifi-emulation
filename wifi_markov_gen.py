@@ -1,7 +1,8 @@
 import socket
+import threading
+import queue
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.signal import welch, resample_poly
+from scipy.signal import resample_poly
 
 UPSAMPLE           = 2
 SAMPLE_RATE        = 20e6 * UPSAMPLE
@@ -44,32 +45,28 @@ def send_iq(iq):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     for i in range(0, len(iq), SAMPLES_PER_PACKET):
         sock.sendto(iq[i:i + SAMPLES_PER_PACKET].tobytes(), (UDP_HOST, UDP_PORT))
-    #sock.sendto(b"END", (UDP_HOST, UDP_PORT))
     sock.close()
-    print("[tx] done")
-
-
-def plot_iq(iq):
-    t_ms        = np.arange(len(iq)) / SAMPLE_RATE * 1e3
-    freqs, psd  = welch(iq, fs=SAMPLE_RATE, nperseg=128, noverlap=64, return_onesided=False)
-    freqs       = np.fft.fftshift(freqs) / 1e6
-    psd         = np.fft.fftshift(10 * np.log10(psd + 1e-12))
-
-    fig, axes = plt.subplots(2, 1, figsize=(12, 6))
-    axes[0].plot(t_ms, np.abs(iq), linewidth=0.5)
-    axes[0].set(xlabel="Time (ms)", ylabel="|IQ|")
-    axes[0].grid(True, alpha=0.4)
-    axes[1].plot(freqs, psd, linewidth=1.0)
-    axes[1].set(xlabel="Frequency (MHz)", ylabel="PSD (dB/Hz)")
-    axes[1].set_xlim(-20, 20)
-    axes[1].grid(True, alpha=0.4)
-    plt.tight_layout()
-    plt.show()
 
 
 if __name__ == "__main__":
-    for i in range (20):
-        print(f"sending batch # {i}")
-        iq = generate_iq()
-        send_iq(iq)
-        #plot_iq(iq)
+    send_q = queue.Queue(maxsize=4)
+
+    def producer():
+        batch_cnt = 0
+        while True:
+            iq = generate_iq()
+            batch_cnt += 1
+            print(f"[gen] batch {batch_cnt} ready")
+            send_q.put(iq)
+
+    def consumer():
+        while True:
+            if send_q.empty():
+                print("[tx] WARNING: queue empty, waiting for data...")
+            iq = send_q.get()
+            send_iq(iq)
+
+    threading.Thread(target=producer, daemon=True).start()
+    threading.Thread(target=consumer, daemon=True).start()
+
+    threading.Event().wait()
