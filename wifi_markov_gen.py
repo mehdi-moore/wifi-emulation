@@ -2,17 +2,23 @@ import socket
 import threading
 import queue
 import numpy as np
+import uhd
 from scipy.signal import resample_poly
 
-UPSAMPLE           = 2
-SAMPLE_RATE        = 20e6 * UPSAMPLE
-TOTAL_SAMPLES      = int(SAMPLE_RATE * 1.0)
+SAMPLE_RATE        = 40.96e6
+BATCH_DURATION_S   = 0.1
+TOTAL_SAMPLES      = int(SAMPLE_RATE * BATCH_DURATION_S)
 MEAN_ON_US         = 200.0
 DUTY_CYCLE         = 0.4
 MEAN_OFF_US        = MEAN_ON_US * (1 - DUTY_CYCLE) / DUTY_CYCLE
 SAMPLES_PER_PACKET = 4096
+CHUNK              = 2048
 UDP_HOST           = "127.0.0.1"
 UDP_PORT           = 5005
+USRP_ADDR          = "addr=192.168.20.2"
+GAIN               = 50.0
+FREQ               = 5.18e9
+TILE_PATH          = "/home/mehdi/Desktop/wifi-emulation/wifi_ofdm_tile_20MSPS_CMPLX64.bin"
 
 
 def markov_onoff(total_samples, mean_on_us, mean_off_us, fs):
@@ -27,8 +33,8 @@ def markov_onoff(total_samples, mean_on_us, mean_off_us, fs):
 
 
 def generate_iq():
-    tile         = np.fromfile("wifi_ofdm_tile_20MSPS_CMPLX64.bin", dtype=np.complex64)
-    tile         = resample_poly(tile, UPSAMPLE, 1).astype(np.complex64)
+    tile         = np.fromfile(TILE_PATH, dtype=np.complex64)
+    tile         = resample_poly(tile, 256, 125).astype(np.complex64)
     tile_samples = len(tile)
 
     segments = markov_onoff(TOTAL_SAMPLES, MEAN_ON_US, MEAN_OFF_US, SAMPLE_RATE)
@@ -48,7 +54,36 @@ def send_iq(iq):
     sock.close()
 
 
+def init_usrp():
+    usrp = uhd.usrp.MultiUSRP(USRP_ADDR)
+    usrp.set_clock_source("internal")
+    ch = 0
+    usrp.set_tx_rate(SAMPLE_RATE, ch)
+    usrp.set_tx_gain(GAIN, ch)
+    usrp.set_tx_freq(uhd.types.TuneRequest(FREQ), ch)
+    tx_args          = uhd.usrp.StreamArgs("fc32", "sc16")
+    tx_args.channels = [ch]
+    tx_stream        = usrp.get_tx_stream(tx_args)
+    md               = uhd.types.TXMetadata()
+    md.start_of_burst = True
+    md.end_of_burst   = False
+    print(f"[usrp] initialised — rate: {SAMPLE_RATE/1e6} MHz, freq: {FREQ/1e9} GHz, gain: {GAIN} dB")
+    return usrp, tx_stream, md
+
+
+def send_iq_usrp(iq, tx_stream, md, sock):
+    n, i = len(iq), 0
+    while i < n:
+        chunk = np.ascontiguousarray(iq[i:i + CHUNK].reshape(1, -1))
+        tx_stream.send(chunk, md)
+        sock.sendto(chunk[0].tobytes(), (UDP_HOST, UDP_PORT))
+        md.start_of_burst = False
+        i += CHUNK
+
+
 if __name__ == "__main__":
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    usrp, tx_stream, md = init_usrp()
     send_q = queue.Queue(maxsize=4)
 
     def producer():
@@ -64,7 +99,7 @@ if __name__ == "__main__":
             if send_q.empty():
                 print("[tx] WARNING: queue empty, waiting for data...")
             iq = send_q.get()
-            send_iq(iq)
+            send_iq_usrp(iq, tx_stream, md, sock)
 
     threading.Thread(target=producer, daemon=True).start()
     threading.Thread(target=consumer, daemon=True).start()
