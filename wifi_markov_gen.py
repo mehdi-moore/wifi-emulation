@@ -2,27 +2,26 @@ import socket
 import time
 import threading
 import queue
+import multiprocessing
 import numpy as np
 import uhd
-from scipy.signal import resample_poly
+from scipy.signal import resample_poly, welch
 import matplotlib.pyplot as plt
-from scipy.signal import welch
 
 SAMPLE_RATE        = 40.96e6
-BATCH_DURATION_S   = 0.01
+BATCH_DURATION_S   = 0.1
 TOTAL_SAMPLES      = int(SAMPLE_RATE * BATCH_DURATION_S)
 MEAN_ON_US         = 200.0
 DUTY_CYCLE         = 0.4
 MEAN_OFF_US        = MEAN_ON_US * (1 - DUTY_CYCLE) / DUTY_CYCLE
-SAMPLES_PER_PACKET = 4096
 CHUNK              = 2048
 UDP_HOST           = "127.0.0.1"
 UDP_PORT           = 5005
 USRP_ADDR          = "addr=192.168.20.2"
 GAIN               = 50.0
+RX_GAIN            = 30.0
 FREQ               = 5.18e9
 TILE_PATH          = "/home/mehdi/Desktop/wifi-emulation/wifi_ofdm_tile_20MSPS_CMPLX64.bin"
-RX_GAIN            = 30.0
 ACCUM_SAMPLES      = 5_000_000
 PLOT_SAMPLES       = 500_000
 
@@ -51,13 +50,6 @@ def generate_iq():
             iq[idx:idx + n_samp] = np.tile(tile, int(np.ceil(n_samp / tile_samples)))[:n_samp]
         idx += n_samp
     return iq
-
-
-def send_iq(iq):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    for i in range(0, len(iq), SAMPLES_PER_PACKET):
-        sock.sendto(iq[i:i + SAMPLES_PER_PACKET].tobytes(), (UDP_HOST, UDP_PORT))
-    sock.close()
 
 
 def init_usrp():
@@ -91,12 +83,11 @@ def init_usrp():
     return usrp, tx_stream, md, rx_stream
 
 
-def send_iq_usrp(iq, tx_stream, md, sock):
+def send_iq_usrp(iq, tx_stream, md):
     n, i = len(iq), 0
     while i < n:
         chunk = np.ascontiguousarray(iq[i:i + CHUNK].reshape(1, -1))
         tx_stream.send(chunk, md)
-        sock.sendto(chunk[0].tobytes(), (UDP_HOST, UDP_PORT))
         md.start_of_burst = False
         i += CHUNK
 
@@ -123,14 +114,37 @@ def receive_iq_usrp(rx_stream, plot_q):
             accum_samples = 0
             if not plot_q.full():
                 plot_q.put(iq)
-            time.sleep(0.1)
+
+
+def plot_worker(plot_q):
+    plt.ion()
+    fig, axes = plt.subplots(2, 1, figsize=(12, 6))
+    while True:
+        iq = plot_q.get()
+
+        t_ms       = np.arange(len(iq)) / SAMPLE_RATE * 1e3
+        freqs, psd = welch(iq, fs=SAMPLE_RATE, nperseg=128, noverlap=64, return_onesided=False)
+        freqs      = np.fft.fftshift(freqs) / 1e6
+        psd        = np.fft.fftshift(10 * np.log10(psd + 1e-12))
+
+        axes[0].cla()
+        axes[0].plot(t_ms, np.abs(iq), linewidth=0.5)
+        axes[0].set(xlabel="Time (ms)", ylabel="|IQ|")
+        axes[0].grid(True, alpha=0.4)
+        axes[1].cla()
+        axes[1].plot(freqs, psd, linewidth=1.0)
+        axes[1].set(xlabel="Frequency (MHz)", ylabel="PSD (dB/Hz)")
+        axes[1].set_xlim(-20, 20)
+        axes[1].grid(True, alpha=0.4)
+        plt.tight_layout()
+        plt.pause(0.01)
 
 
 if __name__ == "__main__":
     usrp, tx_stream, md, rx_stream = init_usrp()
+
+    plot_q = multiprocessing.Queue(maxsize=2)
     send_q = queue.Queue(maxsize=4)
-    plot_q = queue.Queue(maxsize=2)
-    sock   = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def producer():
         batch_cnt = 0
@@ -145,7 +159,7 @@ if __name__ == "__main__":
             if send_q.empty():
                 print("[tx] WARNING: queue empty, waiting for data...")
             iq = send_q.get()
-            send_iq_usrp(iq, tx_stream, md, sock)
+            send_iq_usrp(iq, tx_stream, md)
 
     def receiver():
         receive_iq_usrp(rx_stream, plot_q)
@@ -154,26 +168,6 @@ if __name__ == "__main__":
     threading.Thread(target=consumer,  daemon=True).start()
     threading.Thread(target=receiver,  daemon=True).start()
 
-    # --- plot on main thread ---
-    plt.ion()
-    fig, axes = plt.subplots(2, 1, figsize=(12, 6))
-    while True:
-        iq = plot_q.get()
+    multiprocessing.Process(target=plot_worker, args=(plot_q,), daemon=True).start()
 
-        t_ms       = np.arange(len(iq)) / SAMPLE_RATE * 1e3
-        freqs, psd = welch(iq, fs=SAMPLE_RATE, nperseg=128, noverlap=64, return_onesided=False)
-        freqs      = np.fft.fftshift(freqs) / 1e6
-        psd        = np.fft.fftshift(10 * np.log10(psd + 1e-12))
-
-        if 1:
-            axes[0].cla()
-            axes[0].plot(t_ms, np.abs(iq), linewidth=0.5)
-            axes[0].set(xlabel="Time (ms)", ylabel="|IQ|")
-            axes[0].grid(True, alpha=0.4)
-            axes[1].cla()
-            axes[1].plot(freqs, psd, linewidth=1.0)
-            axes[1].set(xlabel="Frequency (MHz)", ylabel="PSD (dB/Hz)")
-            axes[1].set_xlim(-20, 20)
-            axes[1].grid(True, alpha=0.4)
-            plt.tight_layout()
-            plt.pause(1)
+    threading.Event().wait()
