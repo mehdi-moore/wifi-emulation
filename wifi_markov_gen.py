@@ -8,6 +8,7 @@ import uhd
 from scipy.signal import resample_poly, welch
 import matplotlib.pyplot as plt
 
+TX_MODE            = "usrp"  # "usrp" or "socket"
 SAMPLE_RATE        = 40.96e6
 BATCH_DURATION_S   = 0.1
 TOTAL_SAMPLES      = int(SAMPLE_RATE * BATCH_DURATION_S)
@@ -50,6 +51,11 @@ def generate_iq():
             iq[idx:idx + n_samp] = np.tile(tile, int(np.ceil(n_samp / tile_samples)))[:n_samp]
         idx += n_samp
     return iq
+
+
+def send_iq(iq, sock):
+    for i in range(0, len(iq), CHUNK):
+        sock.sendto(iq[i:i + CHUNK].tobytes(), (UDP_HOST, UDP_PORT))
 
 
 def init_usrp():
@@ -141,33 +147,54 @@ def plot_worker(plot_q):
 
 
 if __name__ == "__main__":
-    usrp, tx_stream, md, rx_stream = init_usrp()
-
-    plot_q = multiprocessing.Queue(maxsize=2)
     send_q = queue.Queue(maxsize=4)
 
-    def producer():
-        batch_cnt = 0
-        while True:
-            iq = generate_iq()
-            batch_cnt += 1
-            print(f"[gen] batch {batch_cnt} ready")
-            send_q.put(iq)
+    if TX_MODE == "usrp":
+        usrp, tx_stream, md, rx_stream = init_usrp()
+        plot_q = multiprocessing.Queue(maxsize=2)
 
-    def consumer():
-        while True:
-            if send_q.empty():
-                print("[tx] WARNING: queue empty, waiting for data...")
-            iq = send_q.get()
-            send_iq_usrp(iq, tx_stream, md)
+        def producer():
+            batch_cnt = 0
+            while True:
+                iq = generate_iq()
+                batch_cnt += 1
+                print(f"[gen] batch {batch_cnt} ready")
+                send_q.put(iq)
 
-    def receiver():
-        receive_iq_usrp(rx_stream, plot_q)
+        def consumer():
+            while True:
+                if send_q.empty():
+                    print("[tx] WARNING: queue empty, waiting for data...")
+                iq = send_q.get()
+                send_iq_usrp(iq, tx_stream, md)
 
-    threading.Thread(target=producer,  daemon=True).start()
-    threading.Thread(target=consumer,  daemon=True).start()
-    threading.Thread(target=receiver,  daemon=True).start()
+        def receiver():
+            receive_iq_usrp(rx_stream, plot_q)
 
-    multiprocessing.Process(target=plot_worker, args=(plot_q,), daemon=True).start()
+        threading.Thread(target=producer,  daemon=True).start()
+        threading.Thread(target=consumer,  daemon=True).start()
+        threading.Thread(target=receiver,  daemon=True).start()
+        multiprocessing.Process(target=plot_worker, args=(plot_q,), daemon=True).start()
+
+    elif TX_MODE == "socket":
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        def producer():
+            batch_cnt = 0
+            while True:
+                iq = generate_iq()
+                batch_cnt += 1
+                print(f"[gen] batch {batch_cnt} ready")
+                send_q.put(iq)
+
+        def consumer():
+            while True:
+                if send_q.empty():
+                    print("[tx] WARNING: queue empty, waiting for data...")
+                iq = send_q.get()
+                send_iq(iq, sock)
+
+        threading.Thread(target=producer, daemon=True).start()
+        threading.Thread(target=consumer, daemon=True).start()
 
     threading.Event().wait()
