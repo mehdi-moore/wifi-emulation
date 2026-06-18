@@ -8,7 +8,7 @@ import uhd
 from scipy.signal import resample_poly, welch
 import matplotlib.pyplot as plt
 
-TX_MODE            = "usrp"  # "usrp" or "socket"
+TX_MODE            = "socket"  # "usrp" or "socket"
 SAMPLE_RATE        = 40.96e6
 BATCH_DURATION_S   = 0.1
 TOTAL_SAMPLES      = int(SAMPLE_RATE * BATCH_DURATION_S)
@@ -23,8 +23,14 @@ GAIN               = 50.0
 RX_GAIN            = 30.0
 FREQ               = 5.18e9
 TILE_PATH          = "/home/mehdi/Desktop/wifi-emulation/wifi_ofdm_tile_20MSPS_CMPLX64.bin"
+PACKET_LEN_PATH    = "/home/mehdi/Desktop/wifi_traffic_analysis/IQ-analysis/packet_length_arr.npy"
+GAPS_PATH          = "/home/mehdi/Desktop/wifi_traffic_analysis/IQ-analysis/gaps_arr.npy"
 ACCUM_SAMPLES      = 5_000_000
 PLOT_SAMPLES       = 500_000
+
+# --- empirical traffic data ---
+packet_len_arr = np.load(PACKET_LEN_PATH)
+gaps_arr       = np.load(GAPS_PATH)
 
 
 def markov_onoff(total_samples, mean_on_us, mean_off_us, fs):
@@ -38,12 +44,25 @@ def markov_onoff(total_samples, mean_on_us, mean_off_us, fs):
     return segments
 
 
+def empirical_onoff(total_samples, packet_len_arr, gaps_arr, fs):
+    segments = []
+    n, state = 0, 0
+    while n < total_samples:
+        dur_us = np.random.choice(packet_len_arr) if state == 1 else np.random.choice(gaps_arr)
+        dur = int(dur_us * 1e-6 * fs)
+        #dur = max(1, dur)
+        segments.append((state, min(dur, total_samples - n)))
+        n += dur
+        state ^= 1
+    return segments
+
+
 def generate_iq():
     tile         = np.fromfile(TILE_PATH, dtype=np.complex64)
     tile         = resample_poly(tile, 256, 125).astype(np.complex64)
     tile_samples = len(tile)
 
-    segments = markov_onoff(TOTAL_SAMPLES, MEAN_ON_US, MEAN_OFF_US, SAMPLE_RATE)
+    segments = empirical_onoff(TOTAL_SAMPLES, packet_len_arr, gaps_arr, SAMPLE_RATE)
     iq = np.zeros(TOTAL_SAMPLES, dtype=np.complex64)
     idx = 0
     for state, n_samp in segments:
