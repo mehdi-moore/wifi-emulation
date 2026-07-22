@@ -63,6 +63,7 @@ def generate_iq():
     tile_samples = len(tile)
 
     segments = empirical_onoff(TOTAL_SAMPLES, packet_len_arr, gaps_arr, SAMPLE_RATE)
+    #segments = markov_onoff(TOTAL_SAMPLES, MEAN_ON_US, MEAN_OFF_US, SAMPLE_RATE)
     iq = np.zeros(TOTAL_SAMPLES, dtype=np.complex64)
     idx = 0
     for state, n_samp in segments:
