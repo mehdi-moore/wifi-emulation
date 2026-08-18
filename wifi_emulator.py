@@ -9,6 +9,7 @@ from scipy.signal import resample_poly, welch
 import matplotlib.pyplot as plt
 
 TX_MODE            = "socket"  # "usrp" or "socket"
+N_TX               = 2         # number of transmitters
 SAMPLE_RATE        = 40.96e6
 BATCH_DURATION_S   = 0.1
 TOTAL_SAMPLES      = int(SAMPLE_RATE * BATCH_DURATION_S)
@@ -17,7 +18,7 @@ DUTY_CYCLE         = 0.4
 MEAN_OFF_US        = MEAN_ON_US * (1 - DUTY_CYCLE) / DUTY_CYCLE
 CHUNK              = 2048
 UDP_HOST           = "127.0.0.1"
-UDP_PORT           = 5005
+UDP_PORTS          = [5005, 5006, 5007, 5008]  # one port per transmitter
 USRP_ADDR          = "addr=192.168.20.2"
 GAIN               = 50.0
 RX_GAIN            = 30.0
@@ -49,8 +50,7 @@ def empirical_onoff(total_samples, packet_len_arr, gaps_arr, fs):
     n, state = 0, 0
     while n < total_samples:
         dur_us = np.random.choice(packet_len_arr) if state == 1 else np.random.choice(gaps_arr)
-        dur = int(dur_us * 1e-6 * fs)
-        #dur = max(1, dur)
+        dur    = int(dur_us * 1e-6 * fs)
         segments.append((state, min(dur, total_samples - n)))
         n += dur
         state ^= 1
@@ -61,9 +61,7 @@ def generate_iq():
     tile         = np.fromfile(TILE_PATH, dtype=np.complex64)
     tile         = resample_poly(tile, 256, 125).astype(np.complex64)
     tile_samples = len(tile)
-
-    segments = empirical_onoff(TOTAL_SAMPLES, packet_len_arr, gaps_arr, SAMPLE_RATE)
-    #segments = markov_onoff(TOTAL_SAMPLES, MEAN_ON_US, MEAN_OFF_US, SAMPLE_RATE)
+    segments     = empirical_onoff(TOTAL_SAMPLES, packet_len_arr, gaps_arr, SAMPLE_RATE)
     iq = np.zeros(TOTAL_SAMPLES, dtype=np.complex64)
     idx = 0
     for state, n_samp in segments:
@@ -73,29 +71,31 @@ def generate_iq():
     return iq
 
 
-def send_iq(iq, sock):
+def send_iq(iq, sock, port):
     for i in range(0, len(iq), CHUNK):
-        sock.sendto(iq[i:i + CHUNK].tobytes(), (UDP_HOST, UDP_PORT))
+        sock.sendto(iq[i:i + CHUNK].tobytes(), (UDP_HOST, port))
 
 
 def init_usrp():
     usrp = uhd.usrp.MultiUSRP(USRP_ADDR)
     usrp.set_clock_source("internal")
 
-    # --- TX ---
-    tx_ch = 0
-    usrp.set_tx_rate(SAMPLE_RATE, tx_ch)
-    usrp.set_tx_gain(GAIN, tx_ch)
-    usrp.set_tx_freq(uhd.types.TuneRequest(FREQ), tx_ch)
+    # --- TX channels ---
+    for tx_ch in range(N_TX):
+        usrp.set_tx_rate(SAMPLE_RATE, tx_ch)
+        usrp.set_tx_gain(GAIN, tx_ch)
+        usrp.set_tx_freq(uhd.types.TuneRequest(FREQ), tx_ch)
+        print(f"[usrp] TX ch{tx_ch} — rate: {SAMPLE_RATE/1e6} MHz, freq: {FREQ/1e9} GHz, gain: {GAIN} dB")
+
     tx_args          = uhd.usrp.StreamArgs("fc32", "sc16")
-    tx_args.channels = [tx_ch]
+    tx_args.channels = list(range(N_TX))
     tx_stream        = usrp.get_tx_stream(tx_args)
     md               = uhd.types.TXMetadata()
     md.start_of_burst = True
     md.end_of_burst   = False
 
     # --- RX ---
-    rx_ch = 1
+    rx_ch = N_TX  # first channel after TX channels
     usrp.set_rx_rate(SAMPLE_RATE, rx_ch)
     usrp.set_rx_gain(RX_GAIN, rx_ch)
     usrp.set_rx_freq(uhd.types.TuneRequest(FREQ), rx_ch)
@@ -103,16 +103,18 @@ def init_usrp():
     rx_args          = uhd.usrp.StreamArgs("fc32", "sc16")
     rx_args.channels = [rx_ch]
     rx_stream        = usrp.get_rx_stream(rx_args)
+    print(f"[usrp] RX ch{rx_ch} — rate: {SAMPLE_RATE/1e6} MHz, freq: {FREQ/1e9} GHz, gain: {RX_GAIN} dB")
 
-    print(f"[usrp] TX — rate: {SAMPLE_RATE/1e6} MHz, freq: {FREQ/1e9} GHz, gain: {GAIN} dB")
-    print(f"[usrp] RX — rate: {SAMPLE_RATE/1e6} MHz, freq: {FREQ/1e9} GHz, gain: {RX_GAIN} dB")
     return usrp, tx_stream, md, rx_stream
 
 
-def send_iq_usrp(iq, tx_stream, md):
+def send_iq_usrp(iq, tx_stream, md, tx_idx):
     n, i = len(iq), 0
+    n_ch = N_TX
     while i < n:
-        chunk = np.ascontiguousarray(iq[i:i + CHUNK].reshape(1, -1))
+        chunk       = np.zeros((n_ch, CHUNK), dtype=np.complex64)
+        chunk[tx_idx] = iq[i:i + CHUNK]
+        chunk       = np.ascontiguousarray(chunk)
         tx_stream.send(chunk, md)
         md.start_of_burst = False
         i += CHUNK
@@ -167,54 +169,58 @@ def plot_worker(plot_q):
 
 
 if __name__ == "__main__":
-    send_q = queue.Queue(maxsize=4)
 
     if TX_MODE == "usrp":
         usrp, tx_stream, md, rx_stream = init_usrp()
         plot_q = multiprocessing.Queue(maxsize=2)
 
-        def producer():
-            batch_cnt = 0
-            while True:
-                iq = generate_iq()
-                batch_cnt += 1
-                print(f"[gen] batch {batch_cnt} ready")
-                send_q.put(iq)
+        for tx_idx in range(N_TX):
+            send_q = queue.Queue(maxsize=4)
 
-        def consumer():
-            while True:
-                if send_q.empty():
-                    print("[tx] WARNING: queue empty, waiting for data...")
-                iq = send_q.get()
-                send_iq_usrp(iq, tx_stream, md)
+            def producer(q=send_q, idx=tx_idx):
+                batch_cnt = 0
+                while True:
+                    iq = generate_iq()
+                    batch_cnt += 1
+                    print(f"[gen] tx{idx} batch {batch_cnt} ready")
+                    q.put(iq)
 
-        def receiver():
-            receive_iq_usrp(rx_stream, plot_q)
+            def consumer(q=send_q, idx=tx_idx):
+                while True:
+                    if q.empty():
+                        print(f"[tx{idx}] WARNING: queue empty, waiting for data...")
+                    iq = q.get()
+                    send_iq_usrp(iq, tx_stream, md, idx)
 
-        threading.Thread(target=producer,  daemon=True).start()
-        threading.Thread(target=consumer,  daemon=True).start()
-        threading.Thread(target=receiver,  daemon=True).start()
+            threading.Thread(target=producer, daemon=True).start()
+            threading.Thread(target=consumer, daemon=True).start()
+
+        threading.Thread(target=lambda: receive_iq_usrp(rx_stream, plot_q), daemon=True).start()
         multiprocessing.Process(target=plot_worker, args=(plot_q,), daemon=True).start()
 
     elif TX_MODE == "socket":
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        def producer():
-            batch_cnt = 0
-            while True:
-                iq = generate_iq()
-                batch_cnt += 1
-                print(f"[gen] batch {batch_cnt} ready")
-                send_q.put(iq)
+        for tx_idx in range(N_TX):
+            send_q = queue.Queue(maxsize=4)
+            sock   = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            port   = UDP_PORTS[tx_idx]
 
-        def consumer():
-            while True:
-                if send_q.empty():
-                    print("[tx] WARNING: queue empty, waiting for data...")
-                iq = send_q.get()
-                send_iq(iq, sock)
+            def producer(q=send_q, idx=tx_idx):
+                batch_cnt = 0
+                while True:
+                    iq = generate_iq()
+                    batch_cnt += 1
+                    print(f"[gen] tx{idx} batch {batch_cnt} ready")
+                    q.put(iq)
 
-        threading.Thread(target=producer, daemon=True).start()
-        threading.Thread(target=consumer, daemon=True).start()
+            def consumer(q=send_q, s=sock, p=port):
+                while True:
+                    if q.empty():
+                        print(f"[tx] WARNING: queue empty, waiting for data...")
+                    iq = q.get()
+                    send_iq(iq, s, p)
+
+            threading.Thread(target=producer, daemon=True).start()
+            threading.Thread(target=consumer, daemon=True).start()
 
     threading.Event().wait()
