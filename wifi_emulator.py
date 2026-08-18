@@ -8,7 +8,7 @@ import uhd
 from scipy.signal import resample_poly, welch
 import matplotlib.pyplot as plt
 
-TX_MODE            = "socket"  # "usrp" or "socket"
+TX_MODE            = "usrp"  # "usrp" or "socket"
 N_TX               = 2         # number of transmitters
 SAMPLE_RATE        = 40.96e6
 BATCH_DURATION_S   = 0.1
@@ -20,7 +20,7 @@ CHUNK              = 2048
 UDP_HOST           = "127.0.0.1"
 UDP_PORTS          = [5005, 5006]  # one port per transmitter
 USRP_ADDR          = "addr=192.168.20.2"
-GAIN               = 50.0
+GAIN               = [50.0, 40.0]  # per-channel TX gain, GAIN[tx_ch]
 RX_GAIN            = 30.0
 FREQ               = 5.18e9
 TILE_PATH          = "/home/mehdi/Desktop/wifi-emulation/wifi_ofdm_tile_20MSPS_CMPLX64.bin"
@@ -32,6 +32,11 @@ PLOT_SAMPLES       = 500_000
 # --- empirical traffic data ---
 packet_len_arr = np.load(PACKET_LEN_PATH)
 gaps_arr       = np.load(GAPS_PATH)
+
+# --- OFDM tile, loaded and resampled once ---
+tile         = np.fromfile(TILE_PATH, dtype=np.complex64)
+tile         = resample_poly(tile, 256, 125).astype(np.complex64)
+tile_samples = len(tile)
 
 
 def markov_onoff(total_samples, mean_on_us, mean_off_us, fs):
@@ -58,9 +63,6 @@ def empirical_onoff(total_samples, packet_len_arr, gaps_arr, fs):
 
 
 def generate_iq():
-    tile         = np.fromfile(TILE_PATH, dtype=np.complex64)
-    tile         = resample_poly(tile, 256, 125).astype(np.complex64)
-    tile_samples = len(tile)
     segments     = empirical_onoff(TOTAL_SAMPLES, packet_len_arr, gaps_arr, SAMPLE_RATE)
     iq = np.zeros(TOTAL_SAMPLES, dtype=np.complex64)
     idx = 0
@@ -83,9 +85,9 @@ def init_usrp():
     # --- TX channels ---
     for tx_ch in range(N_TX):
         usrp.set_tx_rate(SAMPLE_RATE, tx_ch)
-        usrp.set_tx_gain(GAIN, tx_ch)
+        usrp.set_tx_gain(GAIN[tx_ch], tx_ch)
         usrp.set_tx_freq(uhd.types.TuneRequest(FREQ), tx_ch)
-        print(f"[usrp] TX ch{tx_ch} — rate: {SAMPLE_RATE/1e6} MHz, freq: {FREQ/1e9} GHz, gain: {GAIN} dB")
+        print(f"[usrp] TX ch{tx_ch} — rate: {SAMPLE_RATE/1e6} MHz, freq: {FREQ/1e9} GHz, gain: {GAIN[tx_ch]} dB")
 
     tx_args          = uhd.usrp.StreamArgs("fc32", "sc16")
     tx_args.channels = list(range(N_TX))
@@ -95,7 +97,7 @@ def init_usrp():
     md.end_of_burst   = False
 
     # --- RX ---
-    rx_ch = N_TX  # first channel after TX channels
+    rx_ch = 0  # same channel/daughterboard as TX0, via its RX1 port
     usrp.set_rx_rate(SAMPLE_RATE, rx_ch)
     usrp.set_rx_gain(RX_GAIN, rx_ch)
     usrp.set_rx_freq(uhd.types.TuneRequest(FREQ), rx_ch)
@@ -108,13 +110,11 @@ def init_usrp():
     return usrp, tx_stream, md, rx_stream
 
 
-def send_iq_usrp(iq, tx_stream, md, tx_idx):
-    n, i = len(iq), 0
-    n_ch = N_TX
+def send_iq_usrp(iq_multi, tx_stream, md):
+    n = iq_multi.shape[1]
+    i = 0
     while i < n:
-        chunk       = np.zeros((n_ch, CHUNK), dtype=np.complex64)
-        chunk[tx_idx] = iq[i:i + CHUNK]
-        chunk       = np.ascontiguousarray(chunk)
+        chunk = np.ascontiguousarray(iq_multi[:, i:i + CHUNK])
         tx_stream.send(chunk, md)
         md.start_of_burst = False
         i += CHUNK
@@ -125,13 +125,21 @@ def receive_iq_usrp(rx_stream, plot_q):
     stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
     stream_cmd.stream_now = True
     rx_stream.issue_stream_cmd(stream_cmd)
+    print("[rx] stream command issued, entering recv loop")
 
     accumulated   = []
     accum_samples = 0
     recv_buf      = np.zeros((1, CHUNK), dtype=np.complex64)
+    packet_cnt    = 0
 
     while True:
-        rx_stream.recv(recv_buf, recv_md)
+        n = rx_stream.recv(recv_buf, recv_md)
+        if recv_md.error_code != uhd.types.RXMetadataErrorCode.none:
+            print(f"[rx] error: {recv_md.error_code}")
+            continue
+        packet_cnt += 1
+        if packet_cnt % 500 == 0:
+            print(f"[rx] packets: {packet_cnt}, last recv n={n}")
         samples        = recv_buf[0].copy()
         accumulated.append(samples)
         accum_samples += len(samples)
@@ -174,10 +182,10 @@ if __name__ == "__main__":
         usrp, tx_stream, md, rx_stream = init_usrp()
         plot_q = multiprocessing.Queue(maxsize=2)
 
-        for tx_idx in range(N_TX):
-            send_q = queue.Queue(maxsize=4)
+        send_qs = [queue.Queue(maxsize=4) for _ in range(N_TX)]
 
-            def producer(q=send_q, idx=tx_idx):
+        for tx_idx in range(N_TX):
+            def producer(q=send_qs[tx_idx], idx=tx_idx):
                 batch_cnt = 0
                 while True:
                     iq = generate_iq()
@@ -185,15 +193,16 @@ if __name__ == "__main__":
                     print(f"[gen] tx{idx} batch {batch_cnt} ready")
                     q.put(iq)
 
-            def consumer(q=send_q, idx=tx_idx):
-                while True:
-                    if q.empty():
-                        print(f"[tx{idx}] WARNING: queue empty, waiting for data...")
-                    iq = q.get()
-                    send_iq_usrp(iq, tx_stream, md, idx)
-
             threading.Thread(target=producer, daemon=True).start()
-            threading.Thread(target=consumer, daemon=True).start()
+
+        def consumer(qs=send_qs):
+            while True:
+                if any(q.empty() for q in qs):
+                    print("[tx] WARNING: queue empty, waiting for data...")
+                iq_multi = np.stack([q.get() for q in qs], axis=0)
+                send_iq_usrp(iq_multi, tx_stream, md)
+
+        threading.Thread(target=consumer, daemon=True).start()
 
         threading.Thread(target=lambda: receive_iq_usrp(rx_stream, plot_q), daemon=True).start()
         multiprocessing.Process(target=plot_worker, args=(plot_q,), daemon=True).start()
