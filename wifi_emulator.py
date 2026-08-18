@@ -18,7 +18,7 @@ DUTY_CYCLE         = 0.4
 MEAN_OFF_US        = MEAN_ON_US * (1 - DUTY_CYCLE) / DUTY_CYCLE
 CHUNK              = 2048
 UDP_HOST           = "127.0.0.1"
-UDP_PORTS          = [5005, 5006, 5007, 5008]  # one port per transmitter
+UDP_PORTS          = [5005, 5006]  # one port per transmitter
 USRP_ADDR          = "addr=192.168.20.2"
 GAIN               = 50.0
 RX_GAIN            = 30.0
