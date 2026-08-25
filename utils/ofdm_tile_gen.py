@@ -34,8 +34,30 @@ print(f"Saved   : wifi_ofdm_tile.bin  ({symbol.nbytes} bytes)")
 
 # --- Plots ---
 t_us  = np.arange(len(symbol)) / SAMPLE_RATE * 1e6
-spec  = np.fft.fftshift(np.fft.fft(symbol))
-freqs = np.fft.fftshift(np.fft.fftfreq(len(symbol), d=1/SAMPLE_RATE)) / 1e6
+
+# Upsample only for spectral plotting (zero-padding in freq domain = interpolation in time domain)
+UPSAMPLE_FACTOR = 4
+PLOT_SAMPLE_RATE = SAMPLE_RATE * UPSAMPLE_FACTOR
+
+N = len(symbol)
+sym_fft = np.fft.fft(symbol)
+sym_fft_shifted = np.fft.fftshift(sym_fft)
+
+# Zero-pad in the frequency domain, centered
+pad_total = N * (UPSAMPLE_FACTOR - 1)
+pad_left  = pad_total // 2
+pad_right = pad_total - pad_left
+sym_fft_padded = np.concatenate([
+    np.zeros(pad_left, dtype=np.complex64),
+    sym_fft_shifted,
+    np.zeros(pad_right, dtype=np.complex64)
+])
+
+# Back to time domain at higher rate (for plotting only)
+symbol_up = np.fft.ifft(np.fft.ifftshift(sym_fft_padded)) * UPSAMPLE_FACTOR
+
+spec  = np.fft.fftshift(np.fft.fft(symbol_up))
+freqs = np.fft.fftshift(np.fft.fftfreq(len(symbol_up), d=1/PLOT_SAMPLE_RATE)) / 1e6
 psd   = 20 * np.log10(np.abs(spec) + 1e-12)
 
 fig, axes = plt.subplots(2, 1, figsize=(9, 6))
@@ -49,6 +71,7 @@ axes[0].legend(fontsize=8)
 axes[0].grid(True, alpha=0.4)
 
 axes[1].plot(freqs, psd)
+axes[1].set_xlim(-40, 40)
 axes[1].set_xlabel("Frequency (MHz)")
 axes[1].set_ylabel("Magnitude (dB)")
 axes[1].grid(True, alpha=0.4)
